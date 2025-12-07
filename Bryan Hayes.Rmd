@@ -1,0 +1,418 @@
+---
+title: "Gene Expression Analysis and Interpretation"
+output: html_notebook
+---
+
+Install of required libraries
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+if (!require("DESeq2", quietly = TRUE))
+    BiocManager::install("DESeq2")
+
+if (!requireNamespace("clusterProfiler", quietly = TRUE))
+  BiocManager::install("clusterProfiler")
+
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE))
+  BiocManager::install("org.Hs.eg.db")
+
+if (!requireNamespace("enrichplot", quietly = TRUE))
+  install.packages("enrichplot")
+
+if (!requireNamespace("pathview", quietly = TRUE))
+  BiocManager::install("pathview")
+
+if (!requireNamespace("ReactomePA", quietly = TRUE))
+  BiocManager::install("ReactomePA")
+
+if (!requireNamespace("pheatmap", quietly = TRUE))
+  install.packages("pheatmap")
+
+if (!require("glmnet", quietly = TRUE))
+  install.packages("glmnet")
+
+```
+
+Import required libraries
+```{r}
+library(DESeq2)
+library(clusterProfiler)
+library(enrichplot)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(pathview)
+library(pheatmap)
+library(survival)
+library(glmnet)
+```
+
+Set seed to keep result across different compilations
+```{r}
+set.seed(48)
+```
+
+Unziping and reading of the files
+```{r}
+file_path <- paste(getwd(),"brca_tcga_pan_can_atlas_2018.tar.gz", sep = "/")
+untar(file_path)
+
+folder_path <- paste(getwd(),"brca_tcga_pan_can_atlas_2018", sep = "/")
+
+RNA_seq_path <- paste(folder_path,"data_mrna_seq_v2_rsem.txt", sep = "/")
+data_clinical_patient_path <- file.path(folder_path,"data_clinical_patient.txt")
+data_cna_path <- paste(folder_path,"data_cna.txt", sep = "/")
+
+RNA_seq <- read.delim(RNA_seq_path)
+data_clinical_patient <- read.delim(data_clinical_patient_path)
+data_cna <- read.delim(data_cna_path)
+```
+
+Standardising function for the IDs.
+```{r}
+standar_id <- function(x) {
+  x <- gsub("\\.","-",x)
+  substr(x,1,12)
+}
+```
+
+Filtering datasets and collecting the IDs
+```{r}
+RNA_cols <- 3:ncol(RNA_seq)
+RNA_ids <- colnames(RNA_seq)[RNA_cols]
+RNA_ids_std <- standar_id(RNA_ids)
+
+cna_cols <- 3:ncol(data_cna)
+cna_ids <- colnames(data_cna)[cna_cols]
+cna_ids_std <- standar_id(cna_ids)
+
+clin_rows <- 5:nrow(data_clinical_patient)
+clin_ids <- data_clinical_patient$X.Patient.Identifier[clin_rows]
+clin_ids_std <- standar_id(clin_ids)
+```
+
+Reduce datasets to common IDs
+```{r}
+common_ids <- Reduce(intersect, list(RNA_ids_std,cna_ids_std,clin_ids_std))
+
+
+RNA_seq_common <- RNA_seq[, c(1,2,RNA_cols[RNA_ids_std %in% common_ids])]
+cna_common <- data_cna[, c(1,2,cna_cols[cna_ids_std %in% common_ids])]
+clinic_common <- data_clinical_patient[clin_rows[clin_ids_std %in% common_ids],]
+```
+
+Creating metadata with ERBB2 gen info and cancer stage.
+Stage is transformed into I-V.
+ERBB2 is taken into a binary state where 0 means Not Amplified, and 1 means Amplified
+```{r}
+col_stage <- which(colnames(clinic_common) ==
+                    "Neoplasm.Disease.Stage.American.Joint.Committee.on.Cancer.Code")
+
+stage <- clinic_common[,col_stage]
+stage <- gsub("I[^VI]", "I", stage)
+stage <- gsub("V[^\\s]", "V", stage)
+
+stage_factor <- as.factor(stage)
+
+erbb2_row <- which(cna_common$Hugo_Symbol == "ERBB2")
+erbb2_status <- 1*(as.numeric(cna_common[erbb2_row,3:ncol(cna_common)])>0)
+
+assay <- round(as.matrix(RNA_seq_common[,-c(1,2)]))
+rownames(assay) <- RNA_seq_common[,1];
+colnames(assay) <- c(standar_id(colnames(assay)))
+
+metaData <- matrix(0, dim(assay)[2],2)
+
+for (i in 1:dim(assay)[2]){
+  pat_barcode <- standar_id(colnames(assay)[i])
+  idx <- which(pat_barcode == common_ids)
+  metaData[i,1] <- erbb2_status[i]
+  metaData[i,2] <- stage_factor[idx]
+}
+
+metaData[is.na(metaData)] <- 0
+
+colnames(metaData) <- c("ERBB2", "Stage")
+```
+
+Normalising the data
+```{r}
+assay[is.na(assay)] <- 0
+assay[assay<0] <- 0
+
+smallestGroupSize <- 3
+keep <- rowSums(assay >= 10) >= smallestGroupSize
+assay = assay[keep,]
+
+dds <- DESeqDataSetFromMatrix(countData = assay,
+                              colData = metaData,
+                              design = ~ ERBB2)
+
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+
+Checking the top 10 genes
+```{r}
+res <- results(dds)
+res[order(res$padj)[1:10],]
+```
+
+Variance Stabilised Transformed expression values and PCA analysis by ERBB2 gen and by Stage
+```{r}
+vst <- vst(dds)
+
+plotPCA(vst, intgroup = c("ERBB2"))
+plotPCA(vst, intgroup = c("Stage"))
+```
+
+Getting subsets of differentially expressed genes by under and over expressed
+```{r}
+res_sig = res[res$padj<0.05,]
+
+
+DE_over = rownames(res_sig[res_sig$log2FoldChange>0,])
+DE_under = rownames(res_sig[res_sig$log2FoldChange<0,])
+```
+
+Pathway enrichment of over and under expressed
+
+EnrichGoO
+```{r}
+go_results_over = enrichGO(
+  gene          = DE_over,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",  
+  ont           = "BP", 
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+
+print(head(go_results_over))
+
+dotplot(go_results_over, showCategory=10) + ggtitle("Gene Ontology Enrichment Over Expressed")
+```
+
+```{r}
+go_results_under = enrichGO(
+  gene          = DE_under,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",  
+  ont           = "BP", 
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+print(head(go_results_under))
+
+dotplot(go_results_under, showCategory=10) + ggtitle("Gene Ontology Enrichment Under Expressed")
+```
+
+EnrichKEGG
+```{r}
+gene_entrez_over <- bitr(
+  DE_over,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+)
+
+kegg_results_over =  enrichKEGG(
+  gene          = gene_entrez_over[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+print(head(kegg_results_over))
+
+dotplot(kegg_results_over, showCategory=10) + ggtitle("Kegg Pathway Enrichment Over Expressed")
+```
+
+```{r}
+gene_entrez_under <- bitr(
+  DE_under,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+)
+
+
+kegg_results_under =  enrichKEGG(
+  gene          = gene_entrez_under[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+print(head(kegg_results_under))
+
+dotplot(kegg_results_under, showCategory=10) + ggtitle("Kegg Pathway Enrichment Under Expressed")
+```
+
+EnrichPathway
+```{r}
+reactome_results_over =  enrichPathway(
+  gene          = gene_entrez_over[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+)
+
+print(head(reactome_results_over))
+
+
+dotplot(reactome_results_over, showCategory=10) + ggtitle("Reactome Pathway Enrichment Over Expressed")
+```
+
+```{r}
+reactome_results_under =  enrichPathway(
+  gene          = gene_entrez_under[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+)
+
+print(head(reactome_results_under))
+
+dotplot(reactome_results_under, showCategory=10) + ggtitle("Reactome Pathway Enrichment Under Expressed")
+```
+Tree Plots
+
+GO Enrichment
+```{r}
+go_results_under_pw = pairwise_termsim(go_results_under)
+treeplot(go_results_under_pw)+ ggtitle("GO Enrichment Under Expressed")
+```
+
+KEGG Enrichment
+```{r}
+kegg_results_under_pw = pairwise_termsim(kegg_results_under)
+treeplot(kegg_results_under_pw)+ ggtitle("KEGG Enrichment Under Expressed")
+```
+
+Heatmap of Amplified/Not_amplified
+```{r}
+top_DE = order(res$padj)
+
+vsd_DE = assay(vst)[top_DE[1:20],]
+
+annotation_colors = list(Amplified = c(Amplified = "#1f78b4", Not_Amplified = "#33a02c"))
+
+annotation_col = data.frame(Amplified = as.matrix(metaData[,1]))
+rownames(annotation_col) = colnames(vst)
+
+pheatmap(
+  vsd_DE,
+  cluster_rows = TRUE,      
+  cluster_cols = TRUE,  
+  scale = 'row',
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  annotation_col = annotation_col
+  )
+```
+
+Survival Model
+
+Histogram of overall survival months
+```{r}
+col_OS <- which(colnames(clinic_common) == "Overall.Survival.Status")
+uncensored <- which(clinic_common[,col_OS] == "1:DECEASED")
+
+col_OS_T <- which(colnames(clinic_common) == "Overall.Survival..Months.")
+
+hist(as.numeric(clinic_common[uncensored,col_OS_T]), breaks = 50,
+     main = "Histogram of Overall Survival Months",
+     xlab = "Survival [Months]")
+
+```
+
+Setting the event threshold
+```{r}
+status <- clinic_common[,col_OS]
+time <- as.numeric(clinic_common[,col_OS_T])
+time[time<=0] <- 0.1
+
+event <- ifelse(status == "1:DECEASED",1,0)
+```
+
+Creating the model with glmnet
+```{r}
+x <- t(vsd_DE)
+y <- Surv(time = time,
+          event = event)
+cvfit <- cv.glmnet(x,y,
+                   family = "cox",
+                   alpha = 1,
+                   nfolds = 10)
+```
+
+```{r}
+par(mar = c(5, 4, 6, 2) + 0.1)
+plot(cvfit, main = "")
+
+title("Cross-validated partial likelihood\nCox model with LASSO",
+      line = 4,        
+      cex.main = 1.3)
+
+```
+
+```{r}
+cvfit$lambda.min
+cvfit$lambda.1se
+```
+
+Checking the active genes
+```{r}
+coef_min <- coef(cvfit, s = "lambda.min")
+active_genes <- rownames(coef_min)[as.numeric(coef_min) != 0]
+active_genes
+```
+
+Checking the lambda due to no active genes
+```{r}
+lambda_seq <- cvfit$lambda
+min(lambda_seq)
+```
+
+Changing the lambda threshold, and recheking for active genes
+```{r}
+lambda_small <- cvfit$lambda.min / 2
+
+coef_small <- coef(cvfit, s = lambda_small)
+active_genes_small <- rownames(coef_small)[as.numeric(coef_small) != 0]
+active_genes_small
+```
+
+```{r}
+par(mar = c(5, 4, 6, 2) + 0.1)
+plot(cvfit$glmnet.fit, xvar = "lambda", label = TRUE,
+     main = "Coefficient paths")
+abline(v = -log(lambda_small), col = "red", lwd = 2, lty = 2)
+```
+
+Survival rates prediction
+```{r}
+risk_score <- predict(cvfit, newx = x, s = "lambda.min", type = "link")
+
+risk_group <- ifelse(risk_score > median(risk_score), "High", "Low")
+
+fit_km <- survfit(Surv(time, event) ~ risk_group)
+```
+
+```{r}
+plot(fit_km, col = c("blue", "red"), lwd = 2,
+     main = "Survival rates",
+     xlab = "Time", ylab = "Survival probability")
+
+legend("bottomleft", legend = c("Low risk", "High risk"),
+       col = c("blue", "red"), lwd = 2)
+```
