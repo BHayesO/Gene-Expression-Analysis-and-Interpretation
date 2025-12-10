@@ -149,13 +149,15 @@ dds <- DESeqDataSetFromMatrix(countData = assay,
                               design = ~ ERBB2)
 
 dds <- DESeq(dds)
-resultsNames(dds)
 ```
 
 Checking the top 10 genes
 ```{r}
 res <- results(dds)
 res[order(res$padj)[1:10],]
+```
+```{r}
+res[order(abs(res$log2FoldChange), decreasing = TRUE)[1:10], ]
 ```
 
 Variance Stabilised Transformed expression values and PCA analysis by ERBB2 gen and by Stage
