@@ -3,7 +3,11 @@ title: "Gene Expression Analysis and Interpretation"
 output: html_notebook
 ---
 
-Install of required libraries
+Install of required libraries, for this work we will be needing:
+BiocManager, that handles the libraries DESeq2, clusterProfiler, org.Hs.eg.db,
+pathview and ReactomePA.
+We also will be using enrichplot, pheatmap and glmnet.
+All of this are on conditional so they wor't run if already installed.
 ```{r}
 if (!require("BiocManager", quietly = TRUE))
   install.packages("BiocManager")
@@ -17,14 +21,14 @@ if (!requireNamespace("clusterProfiler", quietly = TRUE))
 if (!requireNamespace("org.Hs.eg.db", quietly = TRUE))
   BiocManager::install("org.Hs.eg.db")
 
-if (!requireNamespace("enrichplot", quietly = TRUE))
-  install.packages("enrichplot")
-
 if (!requireNamespace("pathview", quietly = TRUE))
   BiocManager::install("pathview")
 
 if (!requireNamespace("ReactomePA", quietly = TRUE))
   BiocManager::install("ReactomePA")
+
+if (!requireNamespace("enrichplot", quietly = TRUE))
+  install.packages("enrichplot")
 
 if (!requireNamespace("pheatmap", quietly = TRUE))
   install.packages("pheatmap")
@@ -34,7 +38,8 @@ if (!require("glmnet", quietly = TRUE))
 
 ```
 
-Import required libraries
+Now we import all the libraries that will be used in the code. This are all 
+grouped to maintain a clean code.
 ```{r}
 library(DESeq2)
 library(clusterProfiler)
@@ -47,22 +52,28 @@ library(survival)
 library(glmnet)
 ```
 
-Set seed to keep result across different compilations
+Set seed to keep result across different compilations.
 ```{r}
 set.seed(48)
 ```
 
 Unziping and reading of the files
 ```{r}
+#Path to the original zip coming from cbioportal
 file_path <- paste(getwd(),"brca_tcga_pan_can_atlas_2018.tar.gz", sep = "/")
+
+#unzip the file
 untar(file_path)
 
+#Path to the folder
 folder_path <- paste(getwd(),"brca_tcga_pan_can_atlas_2018", sep = "/")
 
-RNA_seq_path <- paste(folder_path,"data_mrna_seq_v2_rsem.txt", sep = "/")
-data_clinical_patient_path <- file.path(folder_path,"data_clinical_patient.txt")
-data_cna_path <- paste(folder_path,"data_cna.txt", sep = "/")
+#Paths of the folders to use for analysis
+RNA_seq_path <- paste(folder_path,"data_mrna_seq_v2_rsem.txt", sep = "/")        #mRNA sequencing data
+data_clinical_patient_path <- file.path(folder_path,"data_clinical_patient.txt") #Clinical data from the patients
+data_cna_path <- paste(folder_path,"data_cna.txt", sep = "/")                    #Copy number alterations
 
+#Setting variables to manage the data
 RNA_seq <- read.delim(RNA_seq_path)
 data_clinical_patient <- read.delim(data_clinical_patient_path)
 data_cna <- read.delim(data_cna_path)
@@ -70,6 +81,7 @@ data_cna <- read.delim(data_cna_path)
 
 Standardising function for the IDs.
 ```{r}
+#Simple function that changes characters and trims the lenght of the IDs to standarise.
 standar_id <- function(x) {
   x <- gsub("\\.","-",x)
   substr(x,1,12)
@@ -78,14 +90,18 @@ standar_id <- function(x) {
 
 Filtering datasets and collecting the IDs
 ```{r}
+
+#Filtering data from the RNA dataset, eliminating columns that will not be used
 RNA_cols <- 3:ncol(RNA_seq)
 RNA_ids <- colnames(RNA_seq)[RNA_cols]
 RNA_ids_std <- standar_id(RNA_ids)
 
+#Filtering data from the CNA dataset, eliminating columns that will not be used
 cna_cols <- 3:ncol(data_cna)
 cna_ids <- colnames(data_cna)[cna_cols]
 cna_ids_std <- standar_id(cna_ids)
 
+#Filtering data from the Clinical dataset, eliminating rows that will not be used
 clin_rows <- 5:nrow(data_clinical_patient)
 clin_ids <- data_clinical_patient$X.Patient.Identifier[clin_rows]
 clin_ids_std <- standar_id(clin_ids)
@@ -93,9 +109,10 @@ clin_ids_std <- standar_id(clin_ids)
 
 Reduce datasets to common IDs
 ```{r}
+#Find the common IDs between all 3 datasets
 common_ids <- Reduce(intersect, list(RNA_ids_std,cna_ids_std,clin_ids_std))
 
-
+#Filter the datasets to keep only those that are common to all the datasets.
 RNA_seq_common <- RNA_seq[, c(1,2,RNA_cols[RNA_ids_std %in% common_ids])]
 cna_common <- data_cna[, c(1,2,cna_cols[cna_ids_std %in% common_ids])]
 clinic_common <- data_clinical_patient[clin_rows[clin_ids_std %in% common_ids],]
@@ -105,22 +122,27 @@ Creating metadata with ERBB2 gen info and cancer stage.
 Stage is transformed into I-V.
 ERBB2 is taken into a binary state where 0 means Not Amplified, and 1 means Amplified
 ```{r}
+#Select the column that contains the stage of cancer, from the Clinical dataset
 col_stage <- which(colnames(clinic_common) ==
                     "Neoplasm.Disease.Stage.American.Joint.Committee.on.Cancer.Code")
 
+#Keep and modify the information of the cancer stage with a simplified version to reduce complexity
 stage <- clinic_common[,col_stage]
 stage <- gsub("I[^VI]", "I", stage)
 stage <- gsub("V[^\\s]", "V", stage)
 
 stage_factor <- as.factor(stage)
 
+#Select the information for the gene ERBB2 from the CNA dataset
 erbb2_row <- which(cna_common$Hugo_Symbol == "ERBB2")
+#Transform the data into a binary state
 erbb2_status <- 1*(as.numeric(cna_common[erbb2_row,3:ncol(cna_common)])>0)
 
 assay <- round(as.matrix(RNA_seq_common[,-c(1,2)]))
 rownames(assay) <- RNA_seq_common[,1];
 colnames(assay) <- c(standar_id(colnames(assay)))
 
+#Creation of the metadata
 metaData <- matrix(0, dim(assay)[2],2)
 
 for (i in 1:dim(assay)[2]){
@@ -137,6 +159,9 @@ colnames(metaData) <- c("ERBB2", "Stage")
 
 Normalising the data
 ```{r}
+
+#Normalization of the data with DESeq
+#Fill na values and replace negative numbers with 0
 assay[is.na(assay)] <- 0
 assay[assay<0] <- 0
 
@@ -156,24 +181,29 @@ Checking the top 10 genes
 res <- results(dds)
 res[order(res$padj)[1:10],]
 ```
+Top 10 Differentially expressed genes ordered by Fold Change
 ```{r}
 res[order(abs(res$log2FoldChange), decreasing = TRUE)[1:10], ]
 ```
 
-Variance Stabilised Transformed expression values and PCA analysis by ERBB2 gen and by Stage
+Variance Stabilized Transformed expression values and PCA analysis by ERBB2 gen and by Stage
 ```{r}
+#We create a vst to realize the PCA
 vst <- vst(dds)
 
+#WE check using ERBB2 and Stage as a parameter to see if there is a clear separation between clusteres
 plotPCA(vst, intgroup = c("ERBB2"))
 plotPCA(vst, intgroup = c("Stage"))
 ```
 
 Getting subsets of differentially expressed genes by under and over expressed
 ```{r}
+#We set the metric for separation using the adjusted p-value
 res_sig = res[res$padj<0.05,]
 
-
+#We separate between over expressed for those with a positive fold change
 DE_over = rownames(res_sig[res_sig$log2FoldChange>0,])
+#And under expressed for those with a negative fold chage
 DE_under = rownames(res_sig[res_sig$log2FoldChange<0,])
 ```
 
@@ -302,8 +332,10 @@ treeplot(kegg_results_under_pw)+ ggtitle("KEGG Enrichment Under Expressed")
 
 Heatmap of Amplified/Not_amplified
 ```{r}
+#We order the results by the adjusted p-value
 top_DE = order(res$padj)
 
+#We select the top 20 values 
 vsd_DE = assay(vst)[top_DE[1:20],]
 
 annotation_colors = list(Amplified = c(Amplified = "#1f78b4", Not_Amplified = "#33a02c"))
@@ -311,6 +343,7 @@ annotation_colors = list(Amplified = c(Amplified = "#1f78b4", Not_Amplified = "#
 annotation_col = data.frame(Amplified = as.matrix(metaData[,1]))
 rownames(annotation_col) = colnames(vst)
 
+#We do a heatmap to check how related are the genes accoring to the ERBB2 amplification
 pheatmap(
   vsd_DE,
   cluster_rows = TRUE,      
@@ -326,6 +359,7 @@ Survival Model
 
 Histogram of overall survival months
 ```{r}
+#Clean the data to separate the deceased to check at what time did the patients die.
 col_OS <- which(colnames(clinic_common) == "Overall.Survival.Status")
 uncensored <- which(clinic_common[,col_OS] == "1:DECEASED")
 
@@ -339,10 +373,12 @@ hist(as.numeric(clinic_common[uncensored,col_OS_T]), breaks = 50,
 
 Setting the event threshold
 ```{r}
+#Clean the data to transform the deceased status into a binary value
 status <- clinic_common[,col_OS]
 time <- as.numeric(clinic_common[,col_OS_T])
+#Transform values to get non negative or 0 values.
 time[time<=0] <- 0.1
-
+#set the threshold event to deceased.
 event <- ifelse(status == "1:DECEASED",1,0)
 ```
 
@@ -374,6 +410,7 @@ cvfit$lambda.1se
 
 Checking the active genes
 ```{r}
+#Cheking the active genes using the min lambda coefficient.
 coef_min <- coef(cvfit, s = "lambda.min")
 active_genes <- rownames(coef_min)[as.numeric(coef_min) != 0]
 active_genes
@@ -381,20 +418,23 @@ active_genes
 
 Checking the lambda due to no active genes
 ```{r}
+#checking the minimum lambda
 lambda_seq <- cvfit$lambda
 min(lambda_seq)
 ```
 
 Changing the lambda threshold, and recheking for active genes
 ```{r}
+#Changing the lambda to get a clear vision of the active genes.
 lambda_small <- cvfit$lambda.min / 2
 
 coef_small <- coef(cvfit, s = lambda_small)
 active_genes_small <- rownames(coef_small)[as.numeric(coef_small) != 0]
 active_genes_small
 ```
-
+Cheking coefficient paths
 ```{r}
+#Checking the coefficients for each gene at different lambda thresholds
 par(mar = c(5, 4, 6, 2) + 0.1)
 plot(cvfit$glmnet.fit, xvar = "lambda", label = TRUE,
      main = "Coefficient paths")
@@ -403,6 +443,7 @@ abline(v = -log(lambda_small), col = "red", lwd = 2, lty = 2)
 
 Survival rates prediction
 ```{r}
+#We create a survival prediction model to separate patients according to this genes
 risk_score <- predict(cvfit, newx = x, s = "lambda.min", type = "link")
 
 risk_group <- ifelse(risk_score > median(risk_score), "High", "Low")
